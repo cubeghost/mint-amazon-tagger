@@ -14,7 +14,9 @@ from collections import defaultdict
 import copy
 import csv
 import datetime
+from dotenv import load_dotenv, find_dotenv
 import logging
+import os
 import pickle
 import string
 import time
@@ -28,6 +30,8 @@ from mint_api import MINT_ROOT_URL
 # from mintapi.api import MINT_ROOT_URL
 
 import category
+
+load_dotenv(find_dotenv())
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
@@ -779,12 +783,16 @@ def main():
     parser = argparse.ArgumentParser(
         description='Tag Mint transactions based on itemized Amazon history.')
 
+    default_mint_email = os.getenv('MINT_EMAIL', None)
+    default_mint_password = os.getenv('MINT_PASSWORD', None)
+    default_description_prefix = os.getenv('DESCRIPTION_PREFIX', DEFAULT_MERCHANT_PREFIX)
+
     parser.add_argument(
-        '--mint_email', default=None,
+        '--mint_email', default=default_mint_email,
         help=('Mint e-mail address for login. If not provided here, will be '
               'prompted for user.'))
     parser.add_argument(
-        '--mint_password', default=None,
+        '--mint_password', default=default_mint_password,
         help=('Mint password for login. If not provided here, will be prompted '
               'for.'))
 
@@ -815,7 +823,7 @@ def main():
 
     parser.add_argument(
         '--description_prefix', type=str,
-        default=DEFAULT_MERCHANT_PREFIX,
+        default=default_description_prefix,
         help=('The prefix to use when updating the description for each Mint '
               'transaction. Default is "Amazon.com: ". This is nice as it '
               'makes transactions still retrieval by searching "amazon". It '

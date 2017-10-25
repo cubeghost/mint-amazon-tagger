@@ -2,3 +2,4 @@ chromedriver
 keyring
 mintapi
 selenium
+python-dotenv
