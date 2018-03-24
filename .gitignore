@@ -1,5 +1,5 @@
 # Application specific:
-Mint Transactions Backup *.pickle
+*.pickle
 Items.csv
 Orders.csv
 Refunds.csv
