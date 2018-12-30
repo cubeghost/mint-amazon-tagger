@@ -1,9 +1,9 @@
 chromedriver
 keyring
-# mintapi
+interruptingcow
+mintapi>=1.29
+progress
+pytest
 readchar
 selenium
 python-dotenv
-requests # Temporary while using local mintapi.
-selenium-requests # Temporary while using local mintapi.
-xmltodict # Temporary while using local mintapi.

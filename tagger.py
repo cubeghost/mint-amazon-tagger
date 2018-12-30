@@ -17,18 +17,23 @@ import itertools
 import logging
 import os
 import pickle
-from pprint import pprint
+import pkg_resources
 import time
+from threading import Thread
 
 import getpass
 import keyring
-# Temporary until mintapi is fixed upstream.
-from mintapifuture.mintapi.api import Mint, MINT_ROOT_URL
+from mintapi.api import Mint, MINT_ROOT_URL
+from progress.bar import IncrementalBar
+from progress.counter import Counter as ProgressCounter
+from progress.spinner import Spinner
 import readchar
 
 import amazon
 import category
-from currency import micro_usd_nearly_equal, micro_usd_to_usd_float, micro_usd_to_usd_string
+from currency import micro_usd_nearly_equal
+from currency import micro_usd_to_usd_float
+from currency import micro_usd_to_usd_string
 import mint
 
 
@@ -39,22 +44,43 @@ logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.INFO)
 
 
-DEFAULT_MERCHANT_PREFIX = 'Amazon.com: '
-DEFAULT_MERCHANT_REFUND_PREFIX = 'Amazon.com refund: '
-
 KEYRING_SERVICE_NAME = 'mintapi'
 
 UPDATE_TRANS_ENDPOINT = '/updateTransaction.xevent'
 
 
+class AsyncProgress:
+    def __init__(self, progress):
+        super()
+        self.progress = progress
+        self.spinning = True
+        self.timer = Thread(target=self.runnable)
+        self.timer.start()
+
+    def runnable(self):
+        while self.spinning:
+            self.progress.next()
+            time.sleep(0.1)
+
+    def finish(self):
+        self.spinning = False
+        self.progress.finish()
+        print()
+
+
 def main():
+    if float(pkg_resources.get_distribution('mintapi').version) < 1.29:
+        print('You are running an incompatible version of mintapi! Please: \n'
+              '  python3 -m pip -U mintapi')
+        exit(1)
+
     parser = argparse.ArgumentParser(
         description='Tag Mint transactions based on itemized Amazon history.')
     define_args(parser)
     args = parser.parse_args()
 
     if args.dry_run:
-        logger.info('Dry Run; no modifications being sent to Mint.')
+        logger.info('\nDry Run; no modifications being sent to Mint.\n')
 
     # Initialize the stats. Explicitly initialize stats that might not be
     # accumulated (conditionals).
@@ -66,29 +92,16 @@ def main():
         no_retag=0,
         retag=0,
         user_skipped_retag=0,
+        personal_cat=0,
     )
 
-    orders = amazon.Order.parse_from_csv(args.orders_csv)
-    items = amazon.Item.parse_from_csv(args.items_csv)
-
-    # Remove items from cancelled orders.
-    items = [i for i in items if not i.is_cancelled()]
-    # Remove items that haven't shipped yet (also aren't charged).
-    items = [i for i in items if i.order_status == 'Shipped']
-    # Remove items with zero quantity (it happens!)
-    items = [i for i in items if i.quantity > 0]
-    # Make more Items such that every item is quantity 1.
-    items = [si for i in items for si in i.split_by_quantity()]
-
-    logger.info('Matching Amazon Items with Orders')
-    amazon.associate_items_with_orders(orders, items)
-
-    refunds = [] if not args.refunds_csv else amazon.Refund.parse_from_csv(args.refunds_csv)
-
-    log_amazon_stats(items, orders, refunds)
-
-    # Only match orders that have items.
-    orders = [o for o in orders if o.items]
+    orders = amazon.Order.parse_from_csv(
+        args.orders_csv, ProgressCounter('Parsing Orders - '))
+    items = amazon.Item.parse_from_csv(
+        args.items_csv, ProgressCounter('Parsing Items - '))
+    refunds = ([] if not args.refunds_csv
+               else amazon.Refund.parse_from_csv(
+                   args.refunds_csv, ProgressCounter('Parsing Refunds - ')))
 
     mint_client = None
 
@@ -116,30 +129,158 @@ def main():
         mint_trans = mint.Transaction.parse_from_json(mint_transactions_json)
         dump_trans_and_categories(mint_trans, mint_category_name_to_id, epoch)
 
-    def get_prefix(is_debit):
-        return (args.description_prefix if is_debit
-                else args.description_return_prefix)
+    mint_historic_category_renames = get_mint_category_history_for_items(
+        mint_trans, args)
+    updates, unmatched_orders = get_mint_updates(
+        orders, items, refunds,
+        mint_trans,
+        args, stats,
+        mint_historic_category_renames,
+        mint_category_name_to_id)
 
-    trans = mint.Transaction.unsplit(mint_trans)
+    log_amazon_stats(items, orders, refunds)
+    log_processing_stats(stats)
+
+    if args.print_unmatched and unmatched_orders:
+        logger.warning(
+            'The following were not matched to Mint transactions:\n')
+        by_oid = defaultdict(list)
+        for uo in unmatched_orders:
+            by_oid[uo.order_id].append(uo)
+        for orders in by_oid.values():
+            if orders[0].is_debit:
+                print_unmatched(amazon.Order.merge(orders))
+            else:
+                for r in amazon.Refund.merge(orders):
+                    print_unmatched(r)
+
+    if not updates:
+        logger.info(
+            'All done; no new tags to be updated at this point in time!')
+        exit(0)
+
+    if args.dry_run:
+        logger.info('Dry run. Following are proposed changes:')
+        if args.skip_dry_print:
+            logger.info('Dry run print results skipped!')
+        else:
+            print_dry_run(updates, ignore_category=args.no_tag_categories)
+
+    else:
+        # Ensure we have a Mint client.
+        if not mint_client:
+            mint_client = get_mint_client(args)
+
+        send_updates_to_mint(
+            updates, mint_client, ignore_category=args.no_tag_categories)
+
+
+def get_mint_category_history_for_items(trans, args):
+    """Gets a mapping of item name -> category name.
+
+    For use in memorizing personalized categories.
+    """
+    if args.do_not_predict_categories:
+        return None
+    # Don't worry about pending.
+    trans = [t for t in trans if not t.is_pending]
+    # Only do debits for now.
+    trans = [t for t in trans if t.is_debit]
+
+    # Filter for transactions that have been tagged before.
+    valid_prefixes = args.amazon_domains.lower().split(',')
+    valid_prefixes = ['{}: '.format(pre) for pre in valid_prefixes]
+    if args.description_prefix_override:
+        valid_prefixes.append(args.description_prefix_override.lower())
+    trans = [t for t in trans if
+             any(t.merchant.lower().startswith(pre)
+                 for pre in valid_prefixes)]
+
+    # Filter out the default category: there is no signal here.
+    trans = [t for t in trans
+             if t.category != category.DEFAULT_MINT_CATEGORY]
+
+    # Filter out non-item merchants.
+    trans = [t for t in trans
+             if t.merchant not in mint.NON_ITEM_MERCHANTS]
+
+    item_to_cats = defaultdict(Counter)
+    for t in trans:
+        # Remove the prefix for the item:
+        for pre in valid_prefixes:
+            item_name = t.merchant.lower()
+            # Find & remove the prefix and remove any leading '3x '.
+            if item_name.startswith(pre):
+                item_name = amazon.rm_leading_qty(item_name[len(pre):])
+                break
+
+        item_to_cats[item_name][t.category] += 1
+
+    item_to_most_common = {}
+    for item_name, counter in item_to_cats.items():
+        item_to_most_common[item_name] = counter.most_common()[0][0]
+
+    return item_to_most_common
+
+
+def get_mint_updates(
+        orders, items, refunds,
+        trans,
+        args, stats,
+        mint_historic_category_renames=None,
+        mint_category_name_to_id=category.DEFAULT_MINT_CATEGORIES_TO_IDS):
+    # Remove items from canceled orders.
+    items = [i for i in items if not i.is_cancelled()]
+    # Remove items that haven't shipped yet (also aren't charged).
+    items = [i for i in items if i.order_status == 'Shipped']
+    # Remove items with zero quantity (it happens!)
+    items = [i for i in items if i.quantity > 0]
+    # Make more Items such that every item is quantity 1. This is critical
+    # prior to associate_items_with_orders such that items with non-1
+    # quantities split into different packages can be associated with the
+    # appropriate order.
+    items = [si for i in items for si in i.split_by_quantity()]
+
+    itemProgress = IncrementalBar(
+        'Matching Amazon Items with Orders',
+        max=len(items))
+    amazon.associate_items_with_orders(orders, items, itemProgress)
+    itemProgress.finish()
+
+    # Only match orders that have items.
+    orders = [o for o in orders if o.items]
+
+    trans = mint.Transaction.unsplit(trans)
     stats['trans'] = len(trans)
     # Skip t if the original description doesn't contain 'amazon'
-    trans = [t for t in trans if 'amazon' in t.omerchant.lower()]
+    merch_whitelist = args.mint_input_merchant_filter.lower().split(',')
+    trans = [t for t in trans if any(
+        merch_str in t.omerchant.lower() for merch_str in merch_whitelist)]
     stats['amazon_in_desc'] = len(trans)
     # Skip t if it's pending.
     trans = [t for t in trans if not t.is_pending]
     stats['pending'] = stats['amazon_in_desc'] - len(trans)
     # Skip t if a category filter is given and t does not match.
     if args.mint_input_categories_filter:
-        whitelist = set(args.mint_input_categories_filter.lower().split(','))
-        trans = [t for t in trans if t.category.lower() in whitelist ]
+        cat_whitelist = set(
+            args.mint_input_categories_filter.lower().split(','))
+        trans = [t for t in trans if t.category.lower() in cat_whitelist]
 
     # Match orders.
-    match_transactions(trans, orders)
+    orderMatchProgress = IncrementalBar(
+        'Matching Amazon Orders w/ Mint Trans',
+        max=len(orders))
+    match_transactions(trans, orders, orderMatchProgress)
+    orderMatchProgress.finish()
 
     unmatched_trans = [t for t in trans if not t.orders]
 
     # Match refunds.
-    match_transactions(unmatched_trans, refunds)
+    refundMatchProgress = IncrementalBar(
+        'Matching Amazon Refunds w/ Mint Trans',
+        max=len(refunds))
+    match_transactions(unmatched_trans, refunds, refundMatchProgress)
+    refundMatchProgress.finish()
 
     unmatched_orders = [o for o in orders if not o.matched]
     unmatched_trans = [t for t in trans if not t.orders]
@@ -165,11 +306,16 @@ def main():
     merged_orders = []
     merged_refunds = []
 
+    updateCounter = IncrementalBar('Determining Mint Updates')
     updates = []
-    for t in matched_trans:
+    for t in updateCounter.iter(matched_trans):
         if t.is_debit:
             order = amazon.Order.merge(t.orders)
             merged_orders.extend(orders)
+
+            prefix = '{}: '.format(order.website)
+            if args.description_prefix_override:
+                prefix = args.description_prefix_override
 
             if order.attribute_subtotal_diff_to_misc_charge():
                 stats['misc_charge'] += 1
@@ -192,21 +338,36 @@ def main():
         else:
             refunds = amazon.Refund.merge(t.orders)
             merged_refunds.extend(refunds)
+            prefix = '{} refund: '.format(refunds[0].website)
+
+            if args.description_return_prefix_override:
+                prefix = args.description_return_prefix_override
 
             new_transactions = [
                 r.to_mint_transaction(t)
                 for r in refunds]
 
-        assert micro_usd_nearly_equal(t.amount, mint.Transaction.sum_amounts(new_transactions))
+        assert micro_usd_nearly_equal(
+            t.amount,
+            mint.Transaction.sum_amounts(new_transactions))
 
         for nt in new_transactions:
-             nt.update_category_id(mint_category_name_to_id)
+            # Look if there's a personal category tagged.
+            item_name = amazon.rm_leading_qty(nt.merchant.lower())
+            if (mint_historic_category_renames and
+                    item_name in mint_historic_category_renames):
+                suggested_cat = mint_historic_category_renames[item_name]
+                if suggested_cat != nt.category:
+                    stats['personal_cat'] += 1
+                    nt.category = mint_historic_category_renames[item_name]
 
-        prefix = get_prefix(t.is_debit)
+            nt.update_category_id(mint_category_name_to_id)
+
         summarize_single_item_order = (
             t.is_debit and len(order.items) == 1 and not args.verbose_itemize)
         if args.no_itemize or summarize_single_item_order:
-            new_transactions = mint.summarize_new_trans(t, new_transactions, prefix)
+            new_transactions = mint.summarize_new_trans(
+                t, new_transactions, prefix)
         else:
             new_transactions = mint.itemize_new_trans(new_transactions, prefix)
 
@@ -215,7 +376,9 @@ def main():
             stats['already_up_to_date'] += 1
             continue
 
-        if t.merchant.startswith(prefix):
+        valid_prefixes = (
+            args.amazon_domains.lower().split(',') + [prefix.lower()])
+        if any(t.merchant.lower().startswith(pre) for pre in valid_prefixes):
             if args.prompt_retag:
                 if args.num_updates > 0 and len(updates) >= args.num_updates:
                     break
@@ -240,29 +403,13 @@ def main():
             stats['new_tag'] += 1
         updates.append((t, new_transactions))
 
-    log_processing_stats(stats)
-
-    if not updates:
-        logger.info(
-            'All done; no new tags to be updated at this point in time!.')
-        exit(0)
-
     if args.num_updates > 0:
-        updates = updates[:num_updates]
+        updates = updates[:args.num_updates]
 
-    if args.dry_run:
-        logger.info('Dry run. Following are proposed changes:')
-        print_dry_run(updates, ignore_category=args.no_tag_categories)
-    else:
-        # Ensure we have a Mint client.
-        if not mint_client:
-            mint_client = get_mint_client(args)
-
-        send_updates_to_mint(
-            updates, mint_client, ignore_category=args.no_tag_categories)
+    return updates, unmatched_orders + unmatched_refunds
 
 
-def mark_best_as_matched(t, list_of_orders_or_refunds):
+def mark_best_as_matched(t, list_of_orders_or_refunds, progress=None):
     if not list_of_orders_or_refunds:
         return
 
@@ -289,9 +436,11 @@ def mark_best_as_matched(t, list_of_orders_or_refunds):
         for o in closest_match:
             o.match(t)
         t.match(closest_match)
+        if progress:
+            progress.next(len(closest_match))
 
 
-def match_transactions(unmatched_trans, unmatched_orders):
+def match_transactions(unmatched_trans, unmatched_orders, progress=None):
     # Also works with Refund objects.
     # First pass: Match up transactions that exactly equal an order's charged
     # amount.
@@ -301,9 +450,9 @@ def match_transactions(unmatched_trans, unmatched_orders):
         amount_to_orders[o.transact_amount()].append([o])
 
     for t in unmatched_trans:
-        mark_best_as_matched(t, amount_to_orders[t.amount])
+        mark_best_as_matched(t, amount_to_orders[t.amount], progress)
 
-    unmatched_orders =  [o for o in unmatched_orders if not o.matched]
+    unmatched_orders = [o for o in unmatched_orders if not o.matched]
     unmatched_trans = [t for t in unmatched_trans if not t.orders]
 
     # Second pass: Match up transactions to a combination of orders (sometimes
@@ -321,7 +470,7 @@ def match_transactions(unmatched_trans, unmatched_orders):
             amount_to_orders[orders_total].append(c)
 
     for t in unmatched_trans:
-        mark_best_as_matched(t, amount_to_orders[t.amount])
+        mark_best_as_matched(t, amount_to_orders[t.amount], progress)
 
 
 def get_mint_client(args):
@@ -334,8 +483,9 @@ def get_mint_client(args):
     if not email:
         email = input('Mint email: ')
 
-    if not password:
-        password = keyring.get_password(KEYRING_SERVICE_NAME, email)
+    # This was causing my grief. Let's let it rest for a while.
+    # if not password:
+    #     password = keyring.get_password(KEYRING_SERVICE_NAME, email)
 
     if not password:
         password = getpass.getpass('Mint password: ')
@@ -344,13 +494,14 @@ def get_mint_client(args):
         logger.error('Missing Mint email or password.')
         exit(1)
 
-    logger.info('Logging in via chromedriver')
-    mint_client = Mint.create(email, password)
+    asyncSpin = AsyncProgress(Spinner('Logging into Mint '))
 
-    logger.info('Login successful!')
+    mint_client = Mint.create(email, password)
 
     # On success, save off password to keyring.
     keyring.set_password(KEYRING_SERVICE_NAME, email, password)
+
+    asyncSpin.finish()
 
     return mint_client
 
@@ -360,41 +511,52 @@ MINT_CATS_PICKLE_FMT = 'Mint {} Categories.pickle'
 
 
 def get_trans_and_categories_from_pickle(pickle_epoch):
-    logger.info('Restoring from pickle backup epoch: {}.'.format(
-        pickle_epoch))
+    label = 'Un-pickling Mint transactions from epoch: {} '.format(
+        pickle_epoch)
+    asyncSpin = AsyncProgress(Spinner(label))
     with open(MINT_TRANS_PICKLE_FMT.format(pickle_epoch), 'rb') as f:
         trans = pickle.load(f)
     with open(MINT_CATS_PICKLE_FMT.format(pickle_epoch), 'rb') as f:
         cats = pickle.load(f)
+    asyncSpin.finish()
 
     return trans, cats
 
 
 def dump_trans_and_categories(trans, cats, pickle_epoch):
-    logger.info(
-        'Backing up Mint Transactions prior to editing. '
-        'Pickle epoch: {}'.format(pickle_epoch))
+    label = 'Backing up Mint to local pickle file, epoch: {} '.format(
+        pickle_epoch)
+    asyncSpin = AsyncProgress(Spinner(label))
     with open(MINT_TRANS_PICKLE_FMT.format(pickle_epoch), 'wb') as f:
         pickle.dump(trans, f)
     with open(MINT_CATS_PICKLE_FMT.format(pickle_epoch), 'wb') as f:
         pickle.dump(cats, f)
+    asyncSpin.finish()
 
 
 def get_trans_and_categories_from_mint(mint_client, oldest_trans_date):
     # Create a map of Mint category name to category id.
     logger.info('Creating Mint Category Map.')
     start_time = time.time()
+    asyncSpin = AsyncProgress(Spinner('Fetching Categories '))
     categories = dict([
         (cat_dict['name'], cat_id)
         for (cat_id, cat_dict) in mint_client.get_categories().items()])
+    asyncSpin.finish()
 
-    start_date_str = oldest_trans_date.strftime('%m/%d/%y')
-    logger.info('Fetching all Mint transactions since {}.'.format(
+    today = datetime.datetime.now().date()
+    # Double the length of transaction history to help aid in
+    # personalized category tagging overrides.
+    start_date = today - (today - oldest_trans_date) * 2
+    start_date_str = start_date.strftime('%m/%d/%y')
+    logger.info('Get all Mint transactions since {}.'.format(
         start_date_str))
+    asyncSpin = AsyncProgress(Spinner('Fetching Transactions '))
     transactions = mint_client.get_transactions_json(
         start_date=start_date_str,
         include_investment=False,
         skip_duplicates=True)
+    asyncSpin.finish()
 
     dur = s_to_time(time.time() - start_time)
     logger.info('Got {} transactions and {} categories from Mint in {}'.format(
@@ -413,7 +575,8 @@ def log_amazon_stats(items, orders, refunds):
     logger.info('{} unmatched orders and {} unmatched items'.format(
         len([o for o in orders if not o.items_matched]),
         len([i for i in items if not i.matched])))
-    logger.info('Orders ranging from {} to {}'.format(first_order_date, last_order_date))
+    logger.info('Orders ranging from {} to {}'.format(
+        first_order_date, last_order_date))
 
     per_item_totals = [i.item_total for i in items]
     per_order_totals = [o.total_charged for o in orders]
@@ -450,9 +613,12 @@ def log_processing_stats(stats):
         'Transactions w/ "Amazon" in description: {amazon_in_desc}\n'
         'Transactions ignored: is pending: {pending}\n'
         '\n'
-        'Orders matched w/ transactions: {order_match} (unmatched orders: {order_unmatch})\n'
-        'Refunds matched w/ transactions: {refund_match} (unmatched refunds: {refund_unmatch})\n'
-        'Transactions matched w/ orders/refunds: {trans_match} (unmatched: {trans_unmatch})\n'
+        'Orders matched w/ transactions: {order_match} (unmatched orders: '
+        '{order_unmatch})\n'
+        'Refunds matched w/ transactions: {refund_match} (unmatched refunds: '
+        '{refund_unmatch})\n'
+        'Transactions matched w/ orders/refunds: {trans_match} (unmatched: '
+        '{trans_unmatch})\n'
         '\n'
         'Orders skipped: not shipped: {skipped_orders_unshipped}\n'
         'Orders skipped: gift card used: {skipped_orders_gift_card}\n'
@@ -460,12 +626,31 @@ def log_processing_stats(stats):
         'Order fix-up: incorrect tax itemization: {adjust_itemized_tax}\n'
         'Order fix-up: has a misc charges (e.g. gift wrap): {misc_charge}\n'
         '\n'
-        'Transactions ignored; already tagged & up to date: {already_up_to_date}\n'
+        'Transactions ignored; already tagged & up to date: '
+        '{already_up_to_date}\n'
         'Transactions ignored; ignore retags: {no_retag}\n'
         'Transactions ignored; user skipped retag: {user_skipped_retag}\n'
         '\n'
+        'Transactions with personalize categories: {personal_cat}\n'
+        '\n'
         'Transactions to be retagged: {retag}\n'
-        'Transactions to be newly tagged: {new_tag}'.format(**stats))
+        'Transactions to be newly tagged: {new_tag}\n'.format(**stats))
+
+
+def print_unmatched(amzn_obj):
+    proposed_mint_desc = mint.summarize_title(
+        [i.get_title() for i in amzn_obj.items]
+        if amzn_obj.is_debit else [amzn_obj.get_title()],
+        '{}{}: '.format(
+            amzn_obj.website, '' if amzn_obj.is_debit else ' refund'))
+    logger.warning('{}'.format(proposed_mint_desc))
+    logger.warning('\t{}\t{}\t{}'.format(
+        amzn_obj.transact_date()
+        if amzn_obj.transact_date()
+        else 'Never shipped!',
+        micro_usd_to_usd_string(amzn_obj.transact_amount()),
+        amazon.get_invoice_url(amzn_obj.order_id)))
+    logger.warning('')
 
 
 def print_dry_run(orig_trans_to_tagged, ignore_category=False):
@@ -498,11 +683,9 @@ def print_dry_run(orig_trans_to_tagged, ignore_category=False):
 
 
 def send_updates_to_mint(updates, mint_client, ignore_category=False):
-    # TODO:
-    #   Unsplits
-    #   Send notes for everything
-
-    logger.info('Sending {} updates to Mint.'.format(len(updates)))
+    updateProgress = IncrementalBar(
+        'Updating Mint',
+        max=len(updates))
 
     start_time = time.time()
     num_requests = 0
@@ -531,6 +714,7 @@ def send_updates_to_mint(updates, mint_client, ignore_category=False):
                     MINT_ROOT_URL,
                     UPDATE_TRANS_ENDPOINT),
                 data=modify_trans).text
+            updateProgress.next()
             logger.debug('Received response: {}'.format(response))
             num_requests += 1
         else:
@@ -559,8 +743,8 @@ def send_updates_to_mint(updates, mint_client, ignore_category=False):
                 itemized_split['txnId{}'.format(i)] = 0
                 if not ignore_category:
                     itemized_split['category{}'.format(i)] = trans.category
-                    itemized_split['categoryId{}'.format(i)] = trans.category_id
-
+                    itemized_split['categoryId{}'.format(i)] = (
+                        trans.category_id)
 
             logger.debug('Sending a "split" transaction request: {}'.format(
                 itemized_split))
@@ -568,9 +752,33 @@ def send_updates_to_mint(updates, mint_client, ignore_category=False):
                 '{}{}'.format(
                     MINT_ROOT_URL,
                     UPDATE_TRANS_ENDPOINT),
-                data=itemized_split).text
-            logger.debug('Received response: {}'.format(response))
+                data=itemized_split)
+            json_resp = response.json()
+            # The first id is always the original transaction (now
+            # parent transaction id).
+            new_trans_ids = json_resp['txnId'][1:]
+            assert len(new_trans_ids) == len(new_trans)
+            for itemized_id, trans in zip(new_trans_ids, new_trans):
+                # Now send the note for each itemized transaction.
+                itemized_note = {
+                    'task': 'txnedit',
+                    'txnId': '{}:0'.format(itemized_id),
+                    'note': trans.note,
+                    'token': mint_client.token,
+                }
+                note_response = mint_client.post(
+                    '{}{}'.format(
+                        MINT_ROOT_URL,
+                        UPDATE_TRANS_ENDPOINT),
+                    data=itemized_note)
+                logger.debug(
+                    'Received note response: {}'.format(note_response.text))
+
+            updateProgress.next()
+            logger.debug('Received response: {}'.format(response.text))
             num_requests += 1
+
+    updateProgress.finish()
 
     dur = s_to_time(time.time() - start_time)
     logger.info('Sent {} updates to Mint in {}'.format(num_requests, dur))
@@ -629,6 +837,9 @@ def define_args(parser):
         help=('Do not modify Mint transaction; instead print the proposed '
               'changes to console.'))
     parser.add_argument(
+        '--skip_dry_print', action='store_true',
+        help=('Do not print dry run results (useful for development).'))
+    parser.add_argument(
         '--num_updates', type=int,
         default=0,
         help=('Only send the first N updates to Mint (or print N updates at '
@@ -649,24 +860,44 @@ def define_args(parser):
               'feature works by looking for "Amazon.com: " at the start of a '
               'transaction. If the user changes the description, then the '
               'tagger won\'t know to leave it alone.'))
+    parser.add_argument(
+        '--print_unmatched', action='store_true',
+        help=('At completion, print unmatched orders to help manual tagging.'))
 
-    # How to tell when to skip a transaction:
+    # Prefix customization:
     parser.add_argument(
-        '--description_prefix', type=str,
-        default=DEFAULT_MERCHANT_PREFIX,
+        '--description_prefix_override', type=str,
         help=('The prefix to use when updating the description for each Mint '
-              'transaction. Default is "Amazon.com: ". This is nice as it '
-              'makes transactions still retrieval by searching "amazon". It '
-              'is also used to detecting if a transaction has already been '
-              'tagged by this tool.'))
+              'transaction. By default, the \'Website\' value from Amazon '
+              'Items/Orders csv is used. If a string is provided, use '
+              'this instead for all matched transactions. If given, this is '
+              'used in conjunction with amazon_domains to detect if a '
+              'transaction has already been tagged by this tool.'))
     parser.add_argument(
-        '--description_return_prefix', type=str,
-        default=DEFAULT_MERCHANT_REFUND_PREFIX,
+        '--description_return_prefix_override', type=str,
         help=('The prefix to use when updating the description for each Mint '
-              'transaction. Default is "Amazon.com refund: ". This is nice as '
-              'it makes transactions still retrieval by searching "amazon". '
-              'It is also used to detecting if a transaction has already been '
-              'tagged by this tool.'))
+              'refund. By default, the \'Website\' value from Amazon '
+              'Items/Orders csv is used with refund appended (e.g. '
+              '\'Amazon.com Refund: ...\'. If a string is provided here, use '
+              'this instead for all matched refunds. If given, this is '
+              'used in conjunction with amazon_domains to detect if a '
+              'refund has already been tagged by this tool.'))
+    parser.add_argument(
+        '--amazon_domains', type=str,
+        # From: https://en.wikipedia.org/wiki/Amazon_(company)#Website
+        default=('amazon.com,amazon.cn,amazon.in,amazon.co.jp,amazon.com.sg,'
+                 'amazon.com.tr,amazon.fr,amazon.de,amazon.it,amazon.nl,'
+                 'amazon.es,amazon.co.uk,amazon.ca,amazon.com.mx,'
+                 'amazon.com.au,amazon.com.br'),
+        help=('A list of all valid Amazon domains/websites. These should '
+              'match the website column from Items/Orders and is used to '
+              'detect if a transaction has already been tagged by this tool.'))
+
+    parser.add_argument(
+        '--mint_input_merchant_filter', type=str,
+        default='amazon,amzn',
+        help=('Only consider Mint transactions that have one of these strings '
+              'in the merchant field. Case-insensitive comma-separated.'))
     parser.add_argument(
         '--mint_input_categories_filter', type=str,
         help=('If present, only consider Mint transactions that match one of '
@@ -680,7 +911,11 @@ def define_args(parser):
               'Amazon doesn\'t provide the best categorization and it is '
               'pretty common user behavior to manually change the categories. '
               'This flag prevents tagger from wiping out that user work.'))
-
+    parser.add_argument(
+        '--do_not_predict_categories', action='store_true',
+        help=('Do not attempt to predict custom category tagging based on any '
+              'tagging overrides. By default (no arg) tagger will attempt to '
+              'find items that you have manually changed categories for.'))
 
 
 if __name__ == '__main__':

@@ -1,16 +1,27 @@
-from collections import defaultdict, Counter
+from collections import defaultdict
 from copy import deepcopy
 import csv
 from datetime import datetime
-from pprint import pformat, pprint
+from pprint import pformat
+import re
 import string
+
+from interruptingcow import timeout
 
 from algorithm_u import algorithm_u
 import category
-from currency import micro_usd_nearly_equal, micro_usd_to_usd_string, parse_usd_as_micro_usd, CENT_MICRO_USD, MICRO_USD_EPS
+from currency import micro_usd_nearly_equal
+from currency import micro_usd_to_usd_string
+from currency import parse_usd_as_micro_usd
+from currency import CENT_MICRO_USD, MICRO_USD_EPS
 from mint import truncate_title
 
 PRINTABLE = set(string.printable)
+
+
+def rm_leading_qty(item_title):
+    """Removes the '2x Item Name' from the front of an item title."""
+    return re.sub(r'^\d+x ', '', item_title)
 
 
 def get_title(amzn_obj, target_length):
@@ -56,7 +67,19 @@ def is_empty_csv(csv_file_obj, key='Quantity'):
     # row.
     filename = csv_file_obj.name
     return (sum([1 for r in csv.DictReader(open(filename))]) <= 1 and
-        next(csv.DictReader(open(filename)))[key] == None)
+            next(csv.DictReader(open(filename)))[key] is None)
+
+
+def parse_from_csv_common(cls, csv_file, progress):
+    if is_empty_csv(csv_file):
+        return []
+
+    reader = csv.DictReader(csv_file)
+    iter = progress.iter(reader) if progress else reader
+    result = [cls(raw_dict) for raw_dict in iter]
+    if progress:
+        print()
+    return result
 
 
 def pythonify_amazon_dict(raw_dict):
@@ -79,7 +102,10 @@ def pythonify_amazon_dict(raw_dict):
     if 'Quantity' in keys:
         raw_dict['Quantity'] = int(raw_dict['Quantity'])
 
-    return dict([(k.lower().replace(' ', '_').replace('/', '_'), v) for k, v in raw_dict.items()])
+    return dict([
+        (k.lower().replace(' ', '_').replace('/', '_'), v)
+        for k, v in raw_dict.items()
+    ])
 
 
 def parse_amazon_date(date_str):
@@ -92,29 +118,33 @@ def parse_amazon_date(date_str):
 
 
 def get_invoice_url(order_id):
-    return 'https://www.amazon.com/gp/css/summary/print.html?ie=UTF8&orderID={oid}'.format(oid=order_id)
+    return (
+        'https://www.amazon.com/gp/css/summary/print.html?ie=UTF8&'
+        'orderID={oid}'.format(oid=order_id))
 
 
-def associate_items_with_orders(orders, items):
+def associate_items_with_orders(all_orders, all_items, itemProgress=None):
     items_by_oid = defaultdict(list)
-    for i in items:
+    for i in all_items:
         items_by_oid[i.order_id].append(i)
     orders_by_oid = defaultdict(list)
-    for o in orders:
+    for o in all_orders:
         orders_by_oid[o.order_id].append(o)
 
     for oid, orders in orders_by_oid.items():
         oid_items = items_by_oid[oid]
 
         if not micro_usd_nearly_equal(
-            Order.sum_subtotals(orders),
-            Item.sum_subtotals(oid_items)):
+                Order.sum_subtotals(orders),
+                Item.sum_subtotals(oid_items)):
             # This is likely due to reports being pulled before all outstanding
             # orders have shipped. Just skip this order for now.
             continue
-        
+
         if len(orders) == 1:
             orders[0].set_items(oid_items, assert_unmatched=True)
+            if itemProgress:
+                itemProgress.next(len(oid_items))
             continue
 
         # First try to divy up the items by tracking.
@@ -123,7 +153,8 @@ def associate_items_with_orders(orders, items):
             items_by_tracking[i.tracking].append(i)
 
         # It is never the case that multiple orders with the same order id will
-        # have the same tracking number.
+        # have the same tracking number. Try using tracking number to split up
+        # the items between the orders.
         for order in orders:
             items = items_by_tracking[order.tracking]
             if micro_usd_nearly_equal(
@@ -131,6 +162,8 @@ def associate_items_with_orders(orders, items):
                     order.subtotal):
                 # A perfect fit.
                 order.set_items(items, assert_unmatched=True)
+                if itemProgress:
+                    itemProgress.next(len(items))
                 # Remove the selected items.
                 oid_items = [i for i in oid_items if i not in items]
         # Remove orders that have items.
@@ -139,19 +172,32 @@ def associate_items_with_orders(orders, items):
             continue
 
         orders = sorted(orders, key=lambda o: o.subtotal)
-        
+
         # Partition the remaining items into every possible arrangement and
         # validate against the remaining orders.
-        for item_groupings in algorithm_u(oid_items, len(orders)):
-            subtotals_with_groupings = sorted(
-                [(Item.sum_subtotals(items), items) for items in item_groupings],
-                key=lambda g: g[0])
-            if all([micro_usd_nearly_equal(
-                    subtotals_with_groupings[i][0],
-                    orders[i].subtotal) for i in range(len(orders))]):
-                for idx, order in enumerate(orders):
-                    order.set_items(subtotals_with_groupings[idx][1], assert_unmatched=True)
-                break
+        # TODO: Make a custom algorithm with backtracking.
+
+        # The number of combinations are factorial, so limit the number of
+        # attempts (by a 1 sec timeout) before giving up.
+        try:
+            with timeout(1, exception=RuntimeError):
+                for item_groupings in algorithm_u(oid_items, len(orders)):
+                    subtotals_with_groupings = sorted(
+                        [(Item.sum_subtotals(itms), itms)
+                         for itms in item_groupings],
+                        key=lambda g: g[0])
+                    if all([micro_usd_nearly_equal(
+                            subtotals_with_groupings[i][0],
+                            orders[i].subtotal) for i in range(len(orders))]):
+                        for idx, order in enumerate(orders):
+                            items = subtotals_with_groupings[idx][1]
+                            order.set_items(items,
+                                            assert_unmatched=True)
+                            if itemProgress:
+                                itemProgress.next(len(items))
+                        break
+        except RuntimeError:
+            pass
 
 
 ORDER_MERGE_FIELDS = {
@@ -169,33 +215,35 @@ class Order:
     items_matched = False
     trans_id = None
     items = []
-    
+    is_debit = True
+
     def __init__(self, raw_dict):
         self.__dict__.update(pythonify_amazon_dict(raw_dict))
-        
-    @classmethod
-    def parse_from_csv(cls, csv_file):
-        if is_empty_csv(csv_file, 'Order Status'):
-            return []
 
-        return [cls(raw_dict) for raw_dict in csv.DictReader(csv_file)]
+    @classmethod
+    def parse_from_csv(cls, csv_file, progress=None):
+        return parse_from_csv_common(cls, csv_file, progress)
 
     @staticmethod
     def sum_subtotals(orders):
         return sum([o.subtotal for o in orders])
 
     def total_by_items(self):
-        return Item.sum_totals(self.items) + self.shipping_charge - self.total_promotions
+        return (
+            Item.sum_totals(self.items) +
+            self.shipping_charge - self.total_promotions)
 
     def total_by_subtotals(self):
-        return self.subtotal + self.tax_charged + self.shipping_charge - self.total_promotions
+        return (
+            self.subtotal + self.tax_charged +
+            self.shipping_charge - self.total_promotions)
 
     def transact_date(self):
         return self.shipment_date
 
     def transact_amount(self):
         return self.total_charged
-    
+
     def match(self, trans):
         self.matched = True
         self.trans_id = trans.id
@@ -262,19 +310,17 @@ class Order:
         return True
 
     def attribute_itemized_diff_to_per_item_tax(self):
-        itemized_sum = self.total_by_items()
-        itemized_diff = self.total_charged - itemized_sum
+        itemized_diff = self.total_charged - self.total_by_items()
         if abs(itemized_diff) < MICRO_USD_EPS:
             return False
 
-        itemized_tax = Item.sum_subtotals_tax(self.items)
-        tax_diff = self.tax_charged - itemized_tax
+        tax_diff = self.tax_charged - Item.sum_subtotals_tax(self.items)
         if itemized_diff - tax_diff > MICRO_USD_EPS:
             return False
 
         # The per-item tax was not computed correctly; the tax miscalculation
         # matches the itemized difference. Sometimes AMZN is bad at math (lol),
-        # and most of the time it's a smiply rounding error. To keep the line
+        # and most of the time it's simply a rounding error. To keep the line
         # items adding up correctly, spread the tax difference across the
         # items.
         tax_rate_per_item = [
@@ -313,10 +359,11 @@ class Order:
                              t,
                              skip_free_shipping=False):
         new_transactions = []
-        
+
         # More expensive items are always more interesting when it comes to
         # budgeting, so show those first (for both itemized and concatted).
-        items = sorted(self.items, key=lambda item: item.item_total, reverse=True)
+        items = sorted(
+            self.items, key=lambda item: item.item_total, reverse=True)
 
         # Itemize line-items:
         for i in items:
@@ -360,7 +407,7 @@ class Order:
                 category=cat,
                 desc='Promotion(s)',
                 note=self.get_note(),
-                isDebit=False)
+                is_debit=False)
             new_transactions.append(promo)
 
         return new_transactions
@@ -371,16 +418,26 @@ class Order:
             result = orders[0]
             result.set_items(Item.merge(result.items))
             return result
-        
+
         result = deepcopy(orders[0])
-        result.set_items(Item.merge([i for o in orders for i in o.items ]))
+        result.set_items(Item.merge([i for o in orders for i in o.items]))
         for key in ORDER_MERGE_FIELDS:
             result.__dict__[key] = sum([o.__dict__[key] for o in orders])
         return result
 
     def __repr__(self):
-        return 'Order ({id}): {date} Total {total}\tSubtotal {subtotal}\tTax {tax}\tPromo {promo}\tShip {ship}\tItems: \n{items}'.format(
-            id=self.order_id, date=(self.shipment_date or self.order_date), total=micro_usd_to_usd_string(self.total_charged), subtotal=micro_usd_to_usd_string(self.subtotal), tax=micro_usd_to_usd_string(self.tax_charged), promo=micro_usd_to_usd_string(self.total_promotions), ship=micro_usd_to_usd_string(self.shipping_charge), items=pformat(self.items))
+        return (
+            'Order ({id}): {date} Total {total}\tSubtotal {subtotal}\t'
+            'Tax {tax}\tPromo {promo}\tShip {ship}\t'
+            'Items: \n{items}'.format(
+                id=self.order_id,
+                date=(self.shipment_date or self.order_date),
+                total=micro_usd_to_usd_string(self.total_charged),
+                subtotal=micro_usd_to_usd_string(self.subtotal),
+                tax=micro_usd_to_usd_string(self.tax_charged),
+                promo=micro_usd_to_usd_string(self.total_promotions),
+                ship=micro_usd_to_usd_string(self.shipping_charge),
+                items=pformat(self.items)))
 
 
 class Item:
@@ -392,12 +449,9 @@ class Item:
         self.__dict__['original_item_subtotal_tax'] = self.item_subtotal_tax
 
     @classmethod
-    def parse_from_csv(cls, csv_file):
-        if is_empty_csv(csv_file):
-            return []
+    def parse_from_csv(cls, csv_file, progress=None):
+        return parse_from_csv_common(cls, csv_file, progress)
 
-        return [cls(raw_dict) for raw_dict in csv.DictReader(csv_file)]
-    
     @staticmethod
     def sum_subtotals(items):
         return sum([i.item_subtotal for i in items])
@@ -454,7 +508,7 @@ class Item:
             unique_items[key].append(i)
         results = []
         for same_items in unique_items.values():
-            qty = len(same_items)
+            qty = sum([i.quantity for i in same_items])
             if qty == 1:
                 results.extend(same_items)
                 continue
@@ -463,15 +517,22 @@ class Item:
             item.set_quantity(qty)
             results.append(item)
         return results
-    
+
     def __repr__(self):
-        return '{qty} of Item: Total {total}\tSubtotal {subtotal}\tTax {tax} {desc}'.format(
-            qty=self.quantity, total=micro_usd_to_usd_string(self.item_total), subtotal=micro_usd_to_usd_string(self.item_subtotal), tax=micro_usd_to_usd_string(self.item_subtotal_tax), desc=self.title)
+        return (
+            '{qty} of Item: Total {total}\tSubtotal {subtotal}\t'
+            'Tax {tax} {desc}'.format(
+                qty=self.quantity,
+                total=micro_usd_to_usd_string(self.item_total),
+                subtotal=micro_usd_to_usd_string(self.item_subtotal),
+                tax=micro_usd_to_usd_string(self.item_subtotal_tax),
+                desc=self.title))
 
 
 class Refund:
     matched = False
     trans_id = None
+    is_debit = False
 
     def __init__(self, raw_dict):
         # Refunds are rad: AMZN doesn't total the tax + sub-total for you.
@@ -485,11 +546,8 @@ class Refund:
         return sum([r.total_refund_amount for r in refunds])
 
     @classmethod
-    def parse_from_csv(cls, csv_file):
-        if is_empty_csv(csv_file):
-            return []
-
-        return [cls(raw_dict) for raw_dict in csv.DictReader(csv_file)]
+    def parse_from_csv(cls, csv_file, progress=None):
+        return parse_from_csv_common(cls, csv_file, progress)
 
     def match(self, trans):
         self.matched = True
@@ -500,7 +558,7 @@ class Refund:
 
     def transact_amount(self):
         return -self.total_refund_amount
-    
+
     def get_title(self, target_length=100):
         return get_title(self, target_length)
 
@@ -510,7 +568,7 @@ class Refund:
             'Buyer: {}\n'
             'Order date: {}\n'
             'Refund date: {}\n'
-            'Refund reason: {}\n',
+            'Refund reason: {}\n'
             'Invoice url: {}').format(
                 self.order_id,
                 self.buyer_name,
@@ -526,8 +584,8 @@ class Refund:
             desc=self.get_title(88),
             category=new_cat,
             amount=-self.total_refund_amount,
-            note = self.get_note(),
-            isDebit=False)
+            note=self.get_note(),
+            is_debit=False)
         return result
 
     @staticmethod
@@ -546,7 +604,7 @@ class Refund:
             unique_refund_items[key].append(r)
         results = []
         for same_items in unique_refund_items.values():
-            qty = len(same_items)
+            qty = sum([i.quantity for i in same_items])
             if qty == 1:
                 results.extend(same_items)
                 continue
@@ -556,10 +614,16 @@ class Refund:
             refund.total_refund_amount *= qty
             refund.refund_amount *= qty
             refund.refund_tax_amount *= qty
-            
+
             results.append(refund)
         return results
 
     def __repr__(self):
-        return '{qty} of Refund: Total {total}\tSubtotal {subtotal}\tTax {tax} {desc}'.format(
-            qty=self.quantity, total=micro_usd_to_usd_string(self.total_refund_amount), subtotal=micro_usd_to_usd_string(self.refund_amount), tax=micro_usd_to_usd_string(self.refund_tax_amount), desc=self.title)
+        return (
+            '{qty} of Refund: Total {total}\tSubtotal {subtotal}\t'
+            'Tax {tax} {desc}'.format(
+                qty=self.quantity,
+                total=micro_usd_to_usd_string(self.total_refund_amount),
+                subtotal=micro_usd_to_usd_string(self.refund_amount),
+                tax=micro_usd_to_usd_string(self.refund_tax_amount),
+                desc=self.title))
